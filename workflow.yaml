@@ -1,0 +1,123 @@
+# This Github Action workflow is a template file for python codebase CI/CD to generate Docker images.
+# The test job will run flake8 linting and pytest on the source code.
+# The build job will build the Docker image with unique image tag, push to DockerHub and run a security check.
+# The deploy job will update a configuration repo containing K8s deployment file with the latest image tag.
+# The configuration repo will have another workflow for applying the incoming changes using kubectl commands (PUSH config).
+
+name: Python Codebase CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      API_USERNAME: ${{ secrets.API_USERNAME }}
+      API_PASSWORD: ${{ secrets.API_PASSWORD }}
+      MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+      ENVIRONMENT: ${{ secrets.ENVIRONMENT }}
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v3
+      with:
+        python-version: "3.10"
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 pytest
+        if [ -f dep/requirements-test.txt ]; then pip install -r dep/requirements-test.txt; fi
+    
+    - name: Lint with flake8
+      run: |
+        # stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    
+    - name: Test with pytest
+      run: |
+        pytest
+
+  build:
+    needs: [test]
+    runs-on: ubuntu-latest
+    env:
+      REPO_NAME: repo-name
+      ORG_NAME: org-name
+      ENV_NAME: ${{ secrets.ENVIRONMENT }}
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set short SHA
+        id: vars
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Prepare image tag using environment and commit ID
+        run: |
+          echo "IMAGE_TAG=$ENV_NAME.${{ steps.vars.outputs.sha_short }}" >> "$GITHUB_ENV"
+
+      - name: Build the Docker image 🐳
+        run: |
+          docker build . --file Dockerfile --tag $ORG_NAME/$REPO_NAME:$IMAGE_TAG
+          docker save $ORG_NAME/$REPO_NAME:$IMAGE_TAG > image.tar
+
+      - name: Login to Docker hub 🐳
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          docker login -u $DOCKER_USERNAME -p $DOCKER_PASSWORD
+
+      - name: Push Docker image to Docker Hub
+        run: |
+          docker push $ORG_NAME/$REPO_NAME:$IMAGE_TAG
+
+      - name: Scan Docker image 🐳
+        uses: snyk/actions/docker@master
+        continue-on-error: true
+        with:
+          image: ${{ env.REPO_NAME }}/${{ env.REPO_NAME }}:${{ env.IMAGE_TAG }}
+          args: --file=Dockerfile --severity-threshold=high --sarif-file-output=snyk.sarif
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Archive compilation results
+        uses: actions/upload-artifact@v3
+        with:
+          name: docker-image
+          path: |
+            image.tar
+
+  deploy:
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    env:
+      REPO_NAME: repo-name
+      ORG_NAME: org-name
+      IMAGE_TAG: image-tag
+      ENV_NAME: ${{ secrets.ENVIRONMENT }}
+      CONFIGURATION_REPO: organisation/repo-name
+    steps:
+      - name: Checkout Kubernetes Manifest repo
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ env.CONFIGURATION_REPO }}
+          token: ${{ secrets.GH_PAT }}
+          ref: master
+
+      - name: Update Image Version in deployment.yaml
+        run: |
+          git config --global user.email "devops@example.com"
+          git config --global user.name "Github Action CI/CD"
+          IMAGE_TAG=$IMAGE_TAG
+          sed -i "/$ORG_NAME/c\        image: $ORG_NAME/$REPO_NAME:$IMAGE_TAG" src/overlays/$ENV_NAME/deployment-patch.yaml
+          git add src/overlays/$ENV_NAME/deployment-patch.yaml
+          git commit -m "Updated Image version to $IMAGE_TAG"
+          git push
